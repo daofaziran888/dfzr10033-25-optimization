@@ -154,6 +154,70 @@ def pipeline_cube_build_cache(
             "consistency": agg_cache_svc.check_cache_consistency(cid)}
 
 
+# -- 聚合缓存覆盖核验链路 --
+
+@router.post("/olap_cube/{cube_id}/coverage-verify")
+def verify_cube_coverage_api(cube_id: int) -> dict[str, Any]:
+    """按缓存分组明细与立方聚合明细核验分区/度量覆盖，生成可复用核验记录。"""
+    result = cube_svc.verify_coverage(cube_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("message", "立方不存在"))
+    return result
+
+
+@router.get("/olap_cube/{cube_id}/coverage-records")
+def get_cube_coverage_records(cube_id: int) -> dict[str, Any]:
+    """读取已生成的覆盖核验记录（分组明细与批次汇总）。"""
+    if store.find("olap_cube", cube_id) is None:
+        raise HTTPException(status_code=404, detail="立方不存在")
+    return cube_svc.coverage_records(cube_id)
+
+
+@router.post("/olap_cube/{cube_id}/read-plan")
+def read_cube_with_coverage(
+    cube_id: int,
+    partitions: str = Query(default=""),
+    measures: str = Query(default=""),
+) -> dict[str, Any]:
+    """按可复用的覆盖核验记录裁定完整/局部读取范围，并回写立方刷新清单。"""
+    part_list = [p.strip() for p in partitions.split(",") if p.strip()] or None
+    meas_list = [m.strip() for m in measures.split(",") if m.strip()] or None
+    result = cube_svc.read_cube(cube_id, partitions=part_list, measures=meas_list)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("message", "立方不存在"))
+    return result
+
+
+@router.post("/olap_cube/{cube_id}/refresh")
+def refresh_cube_partitions(
+    cube_id: int,
+    partitions: str = Query(default=""),
+) -> dict[str, Any]:
+    """刷新立方；``partitions`` 非空时只替换指定分区，并立刻重新核验覆盖。"""
+    part_list = [p.strip() for p in partitions.split(",") if p.strip()] or None
+    result = cube_svc.refresh_cube(cube_id, partitions=part_list)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("message", "立方不存在"))
+    return result
+
+
+@router.post("/aggregate_cache/{entry_id}/mark-update-failed")
+def mark_cache_update_failed(entry_id: int) -> dict[str, Any]:
+    """标记缓存清单更新失败，下次核验强制重新核对受影响分组。"""
+    entry = store.find("aggregate_cache", entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="缓存配置不存在")
+    entry["更新失败"] = True
+    entry["status"] = "淘汰中"
+    entry["pending"] = True
+    entry["abnormal"] = True
+    cube_ref = str(entry.get("目标立方", ""))
+    cube_id = int(cube_ref.rsplit(":", 1)[-1]) if cube_ref.rsplit(":", 1)[-1].isdigit() else 0
+    coverage = cube_svc.verify_coverage(cube_id) if cube_id else None
+    return {"ok": True, "message": "缓存更新失败已登记，相关分组将重新核对",
+            "entry": entry, "coverage": coverage}
+
+
 @router.post("/pipelines/rewrite-estimate-execute")
 def pipeline_rewrite_estimate_execute(
     query: str = Query(default="SELECT * FROM source_registry"),

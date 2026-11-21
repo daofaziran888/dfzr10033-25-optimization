@@ -21,47 +21,40 @@ class AggregateCacheService(BaseModuleService):
     NEGATIVE_ACTIONS = ["强制淘汰", "停用缓存"]
 
     def check_cache_consistency(self, cube_id: int) -> dict[str, Any]:
-        """检查缓存与源 olap_cube 数据的一致性，过期则淘汰。"""
+        """检查缓存与源立方的一致性：按分区/分组/度量核验，而不是只比总行数。"""
         cube = store.find("olap_cube", cube_id)
         if cube is None:
             return {"ok": False, "message": "立方不存在"}
 
-        cache_rows = store.rows(self.MODULE)
+        from app.services.cache_coverage import verify_cube_coverage
+
+        verification = verify_cube_coverage(cube_id)
+        if not verification.get("ok"):
+            return verification
+
         stale_count = 0
-
-        for cache_entry in cache_rows:
-            if cache_entry.get("status") != "生效中":
-                continue
-            if str(cube_id) not in str(cache_entry.get("目标立方", "")):
-                continue
-
-            # 检查缓存是否过期
-            ttl = int(cache_entry.get("TTL秒数", "3600"))
-            cube_rows = cube.get("数据行数", "0")
-            cache_size = cache_entry.get("缓存大小", "0")
-
-            # 如果立方行数变化超过20%，标记为过期
-            try:
-                cube_total = int(cube_rows) if cube_rows.isdigit() else 0
-                cache_total = int(cache_size) if cache_size.isdigit() else 0
-            except (ValueError, TypeError):
-                cube_total = 0
-                cache_total = 0
-
-            if cube_total > 0 and abs(cube_total - cache_total) / cube_total > 0.2:
-                cache_entry["status"] = "淘汰中"
-                cache_entry["pending"] = True
-                stale_count += 1
+        for batch_entry in verification.get("batch_entries", []):
+            if batch_entry["status"] == "冲突" or (
+                batch_entry["status"] == "局部核验"
+            ):
+                entry = store.find(self.MODULE, batch_entry["entry_id"])
+                if entry is not None and entry.get("status") == "生效中":
+                    entry["status"] = "淘汰中"
+                    entry["pending"] = True
+                    stale_count += 1
 
         return {
             "ok": True,
             "cube_id": cube_id,
             "stale_entries": stale_count,
             "cube_row_count": cube.get("数据行数"),
+            "batches": verification.get("batches", []),
+            "versions": verification.get("versions", {}),
+            "entries": verification.get("batch_entries", []),
         }
 
     def prewarm_cube_cache(self, cube_id: int) -> dict[str, Any]:
-        """预热立方缓存：读取 olap_cube 和 semantic_model，写入 aggregate_cache 和 result_cache。"""
+        """预热立方缓存：读取立方的分区聚合明细，签发同源清单与覆盖批次。"""
         cube = store.find("olap_cube", cube_id)
         if cube is None:
             return {"ok": False, "message": "立方不存在"}
@@ -71,21 +64,33 @@ class AggregateCacheService(BaseModuleService):
         meas = cube.get("度量列表", "value").split(",")
         meas = [m.strip() for m in meas if m.strip()]
 
-        # 生成预热数据
-        import random
-        prewarmed = []
-        for i in range(random.randint(20, 100)):
-            row = {}
-            for d in dims:
-                row[d] = f"{d}_prewarm_{random.randint(1, 10)}"
-            for m in meas:
-                row[m] = random.randint(100, 50000)
-            prewarmed.append(row)
+        detail = cube.get("聚合明细")
+        if not isinstance(detail, list) or not detail:
+            return {
+                "ok": False,
+                "message": "立方缺少分区聚合明细，无法签发可核验的缓存清单",
+                "cache_entry_id": None,
+            }
 
-        # 写入 aggregate_cache
+        batch = f"PW-{cube_id:04d}-{uuid.uuid4().hex[:6]}"
+        version = str(cube.get("清单版本") or "v1")
+        manifest = [
+            {
+                "分区": str(row.get("分区", "默认")),
+                "分区标识": str(row.get("分区", "默认")),
+                "分组": row.get("分组"),
+                "度量": list(row.get("度量") or meas),
+                "行数": int(row.get("行数", 0)),
+                "批次": batch,
+                "清单版本": version,
+            }
+            for row in detail
+        ]
+        data = cube.get("聚合明细", [])
+
         rows = store.rows(self.MODULE)
         cache_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
-        data_str = str(prewarmed)
+        data_str = str(data)
         cache = {
             "id": cache_id,
             "配置编号": f"AGGR-PW{cube_id:04d}",
@@ -96,10 +101,15 @@ class AggregateCacheService(BaseModuleService):
             "命中阈值": "0.85",
             "淘汰算法": "LRU",
             "缓存大小": str(len(data_str)),
+            "覆盖批次": batch,
+            "清单版本": version,
+            "覆盖分区": sorted({item["分区"] for item in manifest}),
+            "缓存清单": manifest,
+            "缓存行数": str(sum(item["行数"] for item in manifest)),
             "status": "生效中",
             "pending": True,
             "abnormal": False,
-            "cached_data": prewarmed,
+            "cached_data": data,
         }
         rows.append(cache)
 
@@ -119,38 +129,48 @@ class AggregateCacheService(BaseModuleService):
             "status": "有效",
             "pending": True,
             "abnormal": False,
-            "result_data": prewarmed,
+            "result_data": data,
         }
         result_rows.append(result)
+
+        from app.services.cache_coverage import verify_cube_coverage
 
         return {
             "ok": True,
             "cube_id": cube_id,
-            "prewarmed_rows": len(prewarmed),
+            "prewarmed_rows": len(manifest),
+            "batch": batch,
             "cache_entry_id": cache_id,
             "result_cache_id": result_id,
+            "coverage": verify_cube_coverage(cube_id),
         }
 
-    def evict_stale_cache(self, cube_id: int) -> dict[str, Any]:
-        """淘汰与指定立方相关的过期 aggregate_cache 和 result_cache 条目。"""
+    def evict_stale_cache(self, cube_id: int, partitions: list[str] | None = None) -> dict[str, Any]:
+        """淘汰指定立方的缓存；``partitions`` 非空时只淘汰覆盖这些分区的清单。"""
         evicted = []
+        wanted = {str(p) for p in partitions} if partitions else None
 
         # 淘汰 aggregate_cache
         agg_rows = store.rows(self.MODULE)
         for entry in agg_rows:
-            if str(cube_id) in str(entry.get("目标立方", "")):
-                if entry.get("status") in ("生效中", "草稿"):
-                    entry["status"] = "淘汰中"
-                    entry["abnormal"] = True
-                    evicted.append({
-                        "type": "aggregate_cache",
-                        "id": entry["id"],
-                        "配置编号": entry.get("配置编号"),
-                    })
+            if str(cube_id) not in str(entry.get("目标立方", "")):
+                continue
+            if wanted is not None and not (set(map(str, entry.get("覆盖分区", []))) & wanted):
+                continue
+            if entry.get("status") in ("生效中", "草稿"):
+                entry["status"] = "淘汰中"
+                entry["abnormal"] = True
+                evicted.append({
+                    "type": "aggregate_cache",
+                    "id": entry["id"],
+                    "配置编号": entry.get("配置编号"),
+                })
 
-        # 淘汰 result_cache
+        # 淘汰 result_cache（结果缓存是整版结果，只在整版淘汰时联动）
         result_rows = store.rows("result_cache")
         for entry in result_rows:
+            if wanted is not None:
+                break
             if f"cube_{cube_id}" in str(entry.get("查询摘要", "")) and entry.get("status") == "有效":
                 entry["status"] = "已过期"
                 evicted.append({

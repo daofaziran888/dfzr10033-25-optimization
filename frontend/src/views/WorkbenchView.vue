@@ -28,6 +28,113 @@
       </span>
     </p>
 
+    <section
+      v-if="coverageCubeId"
+      class="coverage-panel"
+      data-testid="coverage-panel"
+    >
+      <header class="coverage-head">
+        <div>
+          <h3>缓存覆盖核验</h3>
+          <p class="page-desc">
+            按分区、分组和度量逐项比对立方聚合明细；只有同一批次能证明覆盖，
+            无变化分组复用已核验结果，更新失败的分组重新核对。
+          </p>
+        </div>
+        <div class="page-actions">
+          <button class="btn" data-testid="coverage-verify" type="button" @click="refreshCoverage">
+            重新核验覆盖
+          </button>
+          <button class="btn" data-testid="coverage-read" type="button" @click="runReadPlan">
+            按核验结果读取
+          </button>
+        </div>
+      </header>
+
+      <div class="stat-row">
+        <article class="stat-card">
+          <span class="stat-label">已核验分组</span>
+          <strong class="stat-value">{{ coverage.verified_groups ?? 0 }}</strong>
+        </article>
+        <article class="stat-card">
+          <span class="stat-label">待核验分组</span>
+          <strong class="stat-value">{{ coverage.pending_groups ?? 0 }}</strong>
+        </article>
+        <article class="stat-card">
+          <span class="stat-label">冲突分组</span>
+          <strong class="stat-value">{{ coverage.conflict_groups ?? 0 }}</strong>
+        </article>
+      </div>
+
+      <table class="data-table" data-testid="coverage-batches">
+        <thead>
+          <tr>
+            <th>覆盖批次</th>
+            <th>清单版本</th>
+            <th>总体状态</th>
+            <th>已核验分区</th>
+            <th>缺失分区</th>
+            <th>已覆盖度量</th>
+            <th>复用/重核</th>
+            <th>立方总计/缓存总计</th>
+            <th>原因</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="batch in coverage.batch_records" :key="batch.id" :data-status="batch.总体状态">
+            <td>{{ batch.批次 }}</td>
+            <td>{{ batch.清单版本 }}</td>
+            <td>{{ batch.总体状态 }}</td>
+            <td>{{ (batch.已核验分区 || []).join('、') || '—' }}</td>
+            <td>{{ (batch.缺失分区 || []).join('、') || '—' }}</td>
+            <td>{{ (batch.已覆盖度量 || []).join('、') || '—' }}</td>
+            <td>{{ batch.复用分组数 }} / {{ batch.重核分组数 }}</td>
+            <td>{{ batch.立方总计行数 ?? '—' }} / {{ batch.缓存总计行数 ?? '—' }}</td>
+            <td class="coverage-reason">{{ batch.原因 }}</td>
+          </tr>
+          <tr v-if="!coverage.batch_records?.length">
+            <td colspan="9" class="empty-state">暂无覆盖核验记录，可先点击“重新核验覆盖”</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p v-if="readback" class="coverage-readback" data-testid="coverage-readback">
+        读取范围：{{ readback.scope }}；批次 {{ readback.batch || '—' }}；
+        可读分区 {{ readback.partitions.join('、') || '无' }}；
+        未覆盖分区 {{ readback.uncovered_partitions.join('、') || '无' }}；
+        未覆盖度量 {{ readback.uncovered_measures.join('、') || '无' }}；
+        总计 {{ readback.cube_total ?? '—' }} / {{ readback.cache_total ?? '—' }}。
+      </p>
+
+      <details class="coverage-groups">
+        <summary>分组核验明细（{{ coverage.group_records?.length ?? 0 }} 条）</summary>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>分区</th>
+              <th>分组</th>
+              <th>度量</th>
+              <th>状态</th>
+              <th>复用</th>
+              <th>更新失败</th>
+              <th>原因</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="group in coverageGroupPreview" :key="group.id" :data-status="group.状态">
+              <td>{{ group.分区 || '—' }}</td>
+              <td class="coverage-group">{{ group.分组 }}</td>
+              <td>{{ group.度量 }}</td>
+              <td>{{ group.状态 }}</td>
+              <td>{{ group.复用 ? '是' : '否' }}</td>
+              <td>{{ group.更新失败 ? '是' : '否' }}</td>
+              <td class="coverage-reason">{{ group.原因 }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -94,16 +201,19 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 
 import {
   createEntry,
   downloadEntries,
   listEntries,
+  loadCoverageRecords,
   moduleMeta,
+  readPlan,
   runAction as applyAction,
+  verifyCoverage,
 } from '@/api/backend-service'
-import type { EntryRow } from '@/data/types'
+import type { CoverageRecordsResult, EntryRow, ReadPlanResult } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
@@ -115,6 +225,26 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const coverage = ref<Partial<CoverageRecordsResult>>({})
+const readback = ref<ReadPlanResult | null>(null)
+const COVERAGE_MODULES = ['aggregate_cache', 'olap_cube']
+const coverageEnabled = computed(() => COVERAGE_MODULES.includes(meta.key))
+const coverageCubeId = computed(() => {
+  if (!coverageEnabled.value) return 0
+  if (meta.key === 'olap_cube') {
+    const row = rows.value.find((item) => Number(item.id) > 0)
+    return row ? Number(row.id) : 0
+  }
+  // 聚合缓存按目标立方引用（olap_cube:1）定位立方；优先取生效中的清单。
+  const candidates = rows.value.filter((item) => String(item['目标立方'] || '').includes(':'))
+  const row = candidates.find((item) => item.status === '生效中') ?? candidates[0]
+  const ref = String(row?.['目标立方'] || '')
+  const id = Number(ref.split(':').pop())
+  return Number.isFinite(id) ? id : 0
+})
+const coverageGroupPreview = computed(() =>
+  (coverage.value.group_records || []).slice(0, 50),
+)
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -182,10 +312,51 @@ async function reload() {
     const payload = await listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
+    await loadCoverage()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
   }
 }
+
+async function loadCoverage() {
+  coverage.value = {}
+  readback.value = null
+  if (!coverageCubeId.value) return
+  try {
+    coverage.value = await loadCoverageRecords(coverageCubeId.value)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '覆盖核验记录读取失败'
+  }
+}
+
+async function refreshCoverage() {
+  if (!coverageCubeId.value) return
+  errorMessage.value = ''
+  try {
+    await verifyCoverage(coverageCubeId.value)
+    await loadCoverage()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '覆盖核验失败'
+  }
+}
+
+async function runReadPlan() {
+  if (!coverageCubeId.value) return
+  errorMessage.value = ''
+  try {
+    readback.value = await readPlan(coverageCubeId.value)
+    await loadCoverage()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '覆盖读取裁定失败'
+  }
+}
+
+watch(
+  () => coverageCubeId.value,
+  () => {
+    if (coverageCubeId.value) void loadCoverage()
+  },
+)
 
 onMounted(reload)
 </script>
